@@ -1,18 +1,11 @@
 const std = @import("std");
 const Io = std.Io;
+const Allocator = std.mem.Allocator;
 
 /// Beacon chain slot number.
-///
-/// Kept as `u64` to match consensus-domain integer width and to avoid
-/// truncation when running long-lived processes.
 pub const Slot = u64;
 /// Beacon chain epoch number.
-///
-/// Also `u64` for the same reason as `Slot`.
 pub const Epoch = u64;
-
-/// Arithmetic errors while mapping between slot and wall-clock time.
-pub const TimeMathError = error{Overflow};
 
 /// Events emitted by `Clock`.
 ///
@@ -35,24 +28,29 @@ pub const ChainForkConfig = struct {
     /// Accepted local clock skew for gossip-related checks, in milliseconds.
     maximum_gossip_clock_disparity_ms: u64,
     /// Number of slots per epoch.
-    slots_per_epoch: Slot,
+    slots_per_epoch: u64,
 };
 
-/// Advanced time/sleep hooks used by `Clock`.
+/// Pluggable clock time provider used by `Clock`.
 ///
-/// Most callers should use `Clock.init(...)` and the default system clock.
-/// This hook set exists for advanced scenarios:
-/// - deterministic tests with virtual time
-/// - custom runtime integrations that provide their own timing source
-///
-/// For tests, prefer `ManualTimeProvider` instead of implementing hooks by hand.
-pub const ClockTimeHooks = struct {
-    /// Opaque pointer passed back into hook functions.
-    ctx: ?*anyopaque = null,
+/// Most callers should use `TimeProvider.system()` via `Clock.init(...)`.
+/// Custom providers are mainly useful for deterministic tests.
+pub const TimeProvider = struct {
+    /// Opaque pointer passed back into provider callbacks.
+    ctx: ?*anyopaque,
     /// Returns current time in unix milliseconds.
-    now_ms: *const fn (ctx: ?*anyopaque) u64 = realNowMsHook,
+    now_ms: *const fn (ctx: ?*anyopaque) u64,
     /// Sleeps for `duration_ms` according to the selected time model.
-    sleep_ms: *const fn (ctx: ?*anyopaque, io: Io, duration_ms: u64) Io.Cancelable!void = realSleepMsHook,
+    sleep_ms: *const fn (ctx: ?*anyopaque, io: Io, duration_ms: u64) Io.Cancelable!void,
+
+    /// Built-in provider backed by real wall clock and real sleep.
+    pub fn system() TimeProvider {
+        return .{
+            .ctx = null,
+            .now_ms = realNowMsHook,
+            .sleep_ms = realSleepMsHook,
+        };
+    }
 };
 
 /// Deterministic manual time source for tests.
@@ -61,8 +59,8 @@ pub const ClockTimeHooks = struct {
 /// production code can use real time, while tests drive virtual time by
 /// calling `advanceMs` or `setNowMs`.
 ///
-/// `hooks()` returns `ClockTimeHooks` so the same `Clock` implementation can
-/// run against this provider without special test-only branches.
+/// `provider()` returns `TimeProvider` so the same `Clock` implementation can
+/// run against this provider.
 pub const ManualTimeProvider = struct {
     io: Io,
     mutex: Io.Mutex = .init,
@@ -77,8 +75,8 @@ pub const ManualTimeProvider = struct {
         };
     }
 
-    /// Return hook set consumable by `Clock.initWithTimeHooks`.
-    pub fn hooks(self: *ManualTimeProvider) ClockTimeHooks {
+    /// Return provider consumable by `Clock.initWithTimeProvider`.
+    pub fn provider(self: *ManualTimeProvider) TimeProvider {
         return .{
             .ctx = @ptrCast(self),
             .now_ms = nowMsHook,
@@ -89,17 +87,17 @@ pub const ManualTimeProvider = struct {
     /// Set absolute virtual time and wake one blocked sleeper.
     pub fn setNowMs(self: *ManualTimeProvider, now_ms: u64) void {
         self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.now_ms = now_ms;
         self.condition.signal(self.io);
-        self.mutex.unlock(self.io);
     }
 
     /// Advance virtual time forward and wake one blocked sleeper.
     pub fn advanceMs(self: *ManualTimeProvider, delta_ms: u64) void {
         self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.now_ms = std.math.add(u64, self.now_ms, delta_ms) catch std.math.maxInt(u64);
         self.condition.signal(self.io);
-        self.mutex.unlock(self.io);
     }
 
     fn nowMsHook(ctx: ?*anyopaque) u64 {
@@ -133,14 +131,18 @@ pub const ManualTimeProvider = struct {
 /// so registration/removal does not allocate.
 pub const AbortSignal = struct {
     aborted_flag: std.atomic.Value(bool) = .init(false),
-    io: Io = std.Options.debug_io,
+    io: Io,
     mutex: Io.Mutex = .init,
     head: ?*Subscription = null,
+
+    /// Create an abort signal bound to a concrete IO handle.
+    pub fn init(io: Io) AbortSignal {
+        return .{ .io = io };
+    }
 
     /// Linked-list node used to subscribe abort callbacks.
     ///
     /// The caller owns the storage and keeps it alive while subscribed.
-    /// This mirrors "listener handle" usage patterns and avoids heap churn.
     pub const Subscription = struct {
         prev: ?*Subscription = null,
         next: ?*Subscription = null,
@@ -246,16 +248,12 @@ pub const AbortSignal = struct {
 };
 
 /// Callback registration for slot events.
-///
-/// Uses `(ctx, fn)` instead of closures to keep ABI simple and allocation-free.
 pub const SlotListener = struct {
     ctx: *anyopaque,
     callback: *const fn (ctx: *anyopaque, slot: Slot) void,
 };
 
 /// Callback registration for epoch events.
-///
-/// Uses `(ctx, fn)` instead of closures to keep ABI simple and allocation-free.
 pub const EpochListener = struct {
     ctx: *anyopaque,
     callback: *const fn (ctx: *anyopaque, epoch: Epoch) void,
@@ -277,25 +275,21 @@ const SlotWaiter = struct {
 /// - Slot listeners and epoch listeners are invoked in-order during catch-up.
 /// - `waitForSlot` callers are parked in `waiters` and signaled when reached.
 ///
-/// This mirrors the TS recursive-`setTimeout` behavior while using Zig async
-/// IO primitives and explicit synchronization.
 ///
 /// Thread-safety:
 /// This type is not safe for concurrent mutation from multiple threads.
 /// Use one owner thread / one IO executor for all API calls.
 pub const Clock = struct {
-    pub const WaitForSlotError = error{Aborted} || Io.Cancelable || std.mem.Allocator.Error;
-    pub const AddSlotListenerError = std.mem.Allocator.Error;
-    pub const AddEpochListenerError = std.mem.Allocator.Error;
+    pub const WaitForSlotError = error{Aborted} || Io.Cancelable || Allocator.Error;
+    pub const AddSlotListenerError = Allocator.Error;
+    pub const AddEpochListenerError = Allocator.Error;
 
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     io: Io,
     config: ChainForkConfig,
     genesis_time_ms: u64,
     signal: *AbortSignal,
-    time_ctx: ?*anyopaque,
-    now_ms_hook: *const fn (ctx: ?*anyopaque) u64,
-    sleep_ms_hook: *const fn (ctx: ?*anyopaque, io: Io, duration_ms: u64) Io.Cancelable!void,
+    time_provider: TimeProvider,
 
     current_slot_cache: Slot,
     slot_listeners: std.ArrayListUnmanaged(SlotListener) = .{},
@@ -311,37 +305,35 @@ pub const Clock = struct {
     /// Initialization is lazy: no timer task is spawned here. The timer starts
     /// on `start()` or on first API call that requires ticking.
     pub fn init(
-        allocator: std.mem.Allocator,
+        allocator: Allocator,
         io: Io,
         config: ChainForkConfig,
         genesis_time_ms: u64,
         signal: *AbortSignal,
     ) Clock {
-        return initWithTimeHooks(allocator, io, config, genesis_time_ms, signal, .{});
+        return initWithTimeProvider(allocator, io, config, genesis_time_ms, signal, TimeProvider.system());
     }
 
-    /// Build a clock instance with explicit time hooks.
+    /// Build a clock instance with explicit time provider.
     ///
     /// This is intended for deterministic tests where callers want to control
     /// perceived time and timer wake-ups.
-    pub fn initWithTimeHooks(
-        allocator: std.mem.Allocator,
+    pub fn initWithTimeProvider(
+        allocator: Allocator,
         io: Io,
         config: ChainForkConfig,
         genesis_time_ms: u64,
         signal: *AbortSignal,
-        time_hooks: ClockTimeHooks,
+        time_provider: TimeProvider,
     ) Clock {
-        const initial_now_ms = time_hooks.now_ms(time_hooks.ctx);
+        const initial_now_ms = time_provider.now_ms(time_provider.ctx);
         return .{
             .allocator = allocator,
             .io = io,
             .config = config,
             .genesis_time_ms = genesis_time_ms,
             .signal = signal,
-            .time_ctx = time_hooks.ctx,
-            .now_ms_hook = time_hooks.now_ms,
-            .sleep_ms_hook = time_hooks.sleep_ms,
+            .time_provider = time_provider,
             .current_slot_cache = getCurrentSlotAtMs(config, genesis_time_ms, initial_now_ms),
         };
     }
@@ -406,12 +398,26 @@ pub const Clock = struct {
 
     /// Unregister a slot listener.
     pub fn offSlot(self: *Clock, listener: SlotListener) void {
-        removeSlotListener(&self.slot_listeners, listener);
+        var i: usize = 0;
+        while (i < self.slot_listeners.items.len) : (i += 1) {
+            const item = self.slot_listeners.items[i];
+            if (item.ctx == listener.ctx and item.callback == listener.callback) {
+                _ = self.slot_listeners.swapRemove(i);
+                return;
+            }
+        }
     }
 
     /// Unregister an epoch listener.
     pub fn offEpoch(self: *Clock, listener: EpochListener) void {
-        removeEpochListener(&self.epoch_listeners, listener);
+        var i: usize = 0;
+        while (i < self.epoch_listeners.items.len) : (i += 1) {
+            const item = self.epoch_listeners.items[i];
+            if (item.ctx == listener.ctx and item.callback == listener.callback) {
+                _ = self.epoch_listeners.swapRemove(i);
+                return;
+            }
+        }
     }
 
     /// Return the current slot and keep internal state caught up.
@@ -464,7 +470,7 @@ pub const Clock = struct {
     /// Return slot as if local clock were reversed by `tolerance_ms`.
     ///
     /// Implemented by shifting genesis forwards, equivalent to `now-tolerance`.
-    pub fn slotWithPastToleranceMs(self: *Clock, tolerance_ms: u64) TimeMathError!Slot {
+    pub fn slotWithPastToleranceMs(self: *Clock, tolerance_ms: u64) error{Overflow}!Slot {
         const adjusted_genesis_ms = try std.math.add(u64, self.genesis_time_ms, tolerance_ms);
         return getCurrentSlotAtMs(self.config, adjusted_genesis_ms, self.nowMs());
     }
@@ -510,7 +516,7 @@ pub const Clock = struct {
     }
 
     /// Milliseconds elapsed from slot start to `to_ms` (or now if null).
-    pub fn msFromSlot(self: *const Clock, slot: Slot, to_ms: ?u64) TimeMathError!i64 {
+    pub fn msFromSlot(self: *const Clock, slot: Slot, to_ms: ?u64) error{Overflow}!i64 {
         const to = to_ms orelse self.nowMs();
         return try diffI64(to, try computeTimeAtSlotMs(self.config, slot, self.genesis_time_ms));
     }
@@ -518,18 +524,21 @@ pub const Clock = struct {
     /// Main scheduling loop.
     ///
     /// Repeats forever:
-    /// - sleep until next slot boundary
     /// - exit early if aborted
-    /// - process slot/epoch advancement
+    /// - catch up to current time
+    /// - sleep until next slot boundary
     fn timerLoop(self: *Clock) void {
         while (true) {
-            self.sleepMs(self.msUntilNextSlot()) catch return;
             if (self.signal.aborted()) {
                 self.abortAllWaiters();
                 self.runner = null;
                 return;
             }
+
+            // Catch up first so a late-started/rearmed loop does not miss the
+            // slot that is already due at current wall time.
             self.onNextSlot(null);
+            self.sleepMs(self.msUntilNextSlot()) catch return;
         }
     }
 
@@ -610,11 +619,11 @@ pub const Clock = struct {
     }
 
     fn nowMs(self: *const Clock) u64 {
-        return self.now_ms_hook(self.time_ctx);
+        return self.time_provider.now_ms(self.time_provider.ctx);
     }
 
     fn sleepMs(self: *Clock, duration_ms: u64) Io.Cancelable!void {
-        return self.sleep_ms_hook(self.time_ctx, self.io, duration_ms);
+        return self.time_provider.sleep_ms(self.time_provider.ctx, self.io, duration_ms);
     }
 
     fn registerWaiter(self: *Clock, waiter: *SlotWaiter) WaitForSlotError!void {
@@ -711,7 +720,7 @@ pub fn computeEpochAtSlot(config: ChainForkConfig, slot: Slot) Epoch {
 /// Compute unix time (milliseconds) for the start boundary of `slot`.
 ///
 /// Returns `error.Overflow` on arithmetic overflow.
-pub fn computeTimeAtSlotMs(config: ChainForkConfig, slot: Slot, genesis_time_ms: u64) TimeMathError!u64 {
+pub fn computeTimeAtSlotMs(config: ChainForkConfig, slot: Slot, genesis_time_ms: u64) error{Overflow}!u64 {
     const delta_ms = try std.math.mul(u64, slot, config.slot_duration_ms);
     return try std.math.add(u64, genesis_time_ms, delta_ms);
 }
@@ -733,28 +742,6 @@ pub fn getCurrentSlotAtMs(config: ChainForkConfig, genesis_time_ms: u64, now_ms:
     return (now_ms - genesis_time_ms) / config.slot_duration_ms;
 }
 
-fn removeSlotListener(list: *std.ArrayListUnmanaged(SlotListener), target: SlotListener) void {
-    var i: usize = 0;
-    while (i < list.items.len) : (i += 1) {
-        const item = list.items[i];
-        if (item.ctx == target.ctx and item.callback == target.callback) {
-            _ = list.swapRemove(i);
-            return;
-        }
-    }
-}
-
-fn removeEpochListener(list: *std.ArrayListUnmanaged(EpochListener), target: EpochListener) void {
-    var i: usize = 0;
-    while (i < list.items.len) : (i += 1) {
-        const item = list.items[i];
-        if (item.ctx == target.ctx and item.callback == target.callback) {
-            _ = list.swapRemove(i);
-            return;
-        }
-    }
-}
-
 fn realNowMs() u64 {
     const timestamp = Io.Clock.real.now(std.Options.debug_io);
     return @as(u64, @intCast(@divTrunc(timestamp.nanoseconds, std.time.ns_per_ms)));
@@ -771,7 +758,7 @@ fn realSleepMsHook(ctx: ?*anyopaque, io: Io, duration_ms: u64) Io.Cancelable!voi
     try io.sleep(.fromMilliseconds(sleep_ms_i64), .awake);
 }
 
-fn diffI64(a: u64, b: u64) TimeMathError!i64 {
+fn diffI64(a: u64, b: u64) error{Overflow}!i64 {
     const diff = @as(i128, @intCast(a)) - @as(i128, @intCast(b));
     return std.math.cast(i64, diff) orelse error.Overflow;
 }
@@ -904,9 +891,9 @@ const EventRecorder = struct {
 };
 
 test "clock smoke compiles and exercises async paths on master" {
-    var signal = AbortSignal{};
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
     defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
 
     const genesis_time_ms = realNowMs();
 
@@ -943,13 +930,13 @@ test "clock smoke compiles and exercises async paths on master" {
 }
 
 test "clock can be driven by manual time provider" {
-    var signal = AbortSignal{};
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
     defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
 
     var manual_time = ManualTimeProvider.init(threaded.io(), 50_000);
 
-    var clock = Clock.initWithTimeHooks(
+    var clock = Clock.initWithTimeProvider(
         std.testing.allocator,
         threaded.io(),
         .{
@@ -959,7 +946,7 @@ test "clock can be driven by manual time provider" {
         },
         50_000,
         &signal,
-        manual_time.hooks(),
+        manual_time.provider(),
     );
     defer clock.deinit();
 
@@ -984,12 +971,12 @@ test "clock can be driven by manual time provider" {
 }
 
 test "waitForSlot abort path resolves and releases waiter" {
-    var signal = AbortSignal{};
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
     defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
 
     var manual_time = ManualTimeProvider.init(threaded.io(), 10_000);
-    var clock = Clock.initWithTimeHooks(
+    var clock = Clock.initWithTimeProvider(
         std.testing.allocator,
         threaded.io(),
         .{
@@ -999,7 +986,7 @@ test "waitForSlot abort path resolves and releases waiter" {
         },
         10_000,
         &signal,
-        manual_time.hooks(),
+        manual_time.provider(),
     );
     defer clock.deinit();
 
@@ -1024,14 +1011,14 @@ test "waitForSlot abort path resolves and releases waiter" {
 }
 
 test "manual time tick emits deterministic slot and epoch order step-by-step" {
-    var signal = AbortSignal{};
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
     defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
 
     var manual_time = ManualTimeProvider.init(threaded.io(), 100_000);
     var recorder = EventRecorder.init(threaded.io());
 
-    var clock = Clock.initWithTimeHooks(
+    var clock = Clock.initWithTimeProvider(
         std.testing.allocator,
         threaded.io(),
         .{
@@ -1041,7 +1028,7 @@ test "manual time tick emits deterministic slot and epoch order step-by-step" {
         },
         100_000,
         &signal,
-        manual_time.hooks(),
+        manual_time.provider(),
     );
     defer clock.deinit();
 
@@ -1114,6 +1101,126 @@ test "manual time tick emits deterministic slot and epoch order step-by-step" {
         };
         try recorder.expect(expected[0..]);
     }
+
+    signal.abort();
+}
+
+test "currentSlot single call catches up multiple missed slots in order" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
+
+    var manual_time = ManualTimeProvider.init(threaded.io(), 200_000);
+    var recorder = EventRecorder.init(threaded.io());
+
+    var clock = Clock.initWithTimeProvider(
+        std.testing.allocator,
+        threaded.io(),
+        .{
+            .slot_duration_ms = 1_000,
+            .maximum_gossip_clock_disparity_ms = 500,
+            .slots_per_epoch = 4,
+        },
+        200_000,
+        &signal,
+        manual_time.provider(),
+    );
+    defer clock.deinit();
+
+    try clock.onSlot(.{ .ctx = @ptrCast(&recorder), .callback = EventRecorder.onSlot });
+    try clock.onEpoch(.{ .ctx = @ptrCast(&recorder), .callback = EventRecorder.onEpoch });
+
+    try std.testing.expectEqual(@as(Slot, 0), clock.currentSlot());
+
+    manual_time.advanceMs(5_000);
+
+    try std.testing.expectEqual(@as(Slot, 5), clock.currentSlot());
+    try recorder.waitForLen(threaded.io(), 6);
+
+    const expected = [_]RecordedEvent{
+        .{ .kind = .slot, .value = 1 },
+        .{ .kind = .slot, .value = 2 },
+        .{ .kind = .slot, .value = 3 },
+        .{ .kind = .slot, .value = 4 },
+        .{ .kind = .epoch, .value = 1 },
+        .{ .kind = .slot, .value = 5 },
+    };
+    try recorder.expect(expected[0..]);
+
+    signal.abort();
+}
+
+test "currentSlot rearm restores next-slot cadence after catch-up" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    var signal = AbortSignal.init(threaded.io());
+
+    var manual_time = ManualTimeProvider.init(threaded.io(), 300_000);
+    var recorder = EventRecorder.init(threaded.io());
+
+    var clock = Clock.initWithTimeProvider(
+        std.testing.allocator,
+        threaded.io(),
+        .{
+            .slot_duration_ms = 1_000,
+            .maximum_gossip_clock_disparity_ms = 500,
+            .slots_per_epoch = 4,
+        },
+        300_000,
+        &signal,
+        manual_time.provider(),
+    );
+    defer clock.deinit();
+
+    try clock.onSlot(.{ .ctx = @ptrCast(&recorder), .callback = EventRecorder.onSlot });
+    try clock.onEpoch(.{ .ctx = @ptrCast(&recorder), .callback = EventRecorder.onEpoch });
+
+    try std.testing.expectEqual(@as(Slot, 0), clock.currentSlot());
+
+    // Jump forward, then use currentSlot() to trigger rearm + synchronous catch-up.
+    manual_time.advanceMs(5_000);
+    try std.testing.expectEqual(@as(Slot, 5), clock.currentSlot());
+    try recorder.waitForLen(threaded.io(), 6);
+
+    // Before the full 1_000ms boundary, no new slot should fire.
+    manual_time.advanceMs(999);
+    const before_boundary = [_]RecordedEvent{
+        .{ .kind = .slot, .value = 1 },
+        .{ .kind = .slot, .value = 2 },
+        .{ .kind = .slot, .value = 3 },
+        .{ .kind = .slot, .value = 4 },
+        .{ .kind = .epoch, .value = 1 },
+        .{ .kind = .slot, .value = 5 },
+    };
+    try recorder.expect(before_boundary[0..]);
+
+    // Hitting the last 1ms should trigger exactly the next slot.
+    manual_time.advanceMs(1);
+    const deadline_ms = realNowMs() + 250;
+    while (realNowMs() < deadline_ms) {
+        var current_len: usize = 0;
+        recorder.mutex.lockUncancelable(threaded.io());
+        current_len = recorder.len;
+        recorder.mutex.unlock(threaded.io());
+        if (current_len >= 7) break;
+        try threaded.io().sleep(.fromMilliseconds(1), .awake);
+    }
+
+    recorder.mutex.lockUncancelable(threaded.io());
+    const final_len = recorder.len;
+    recorder.mutex.unlock(threaded.io());
+    try std.testing.expectEqual(@as(usize, 7), final_len);
+
+    const after_boundary = [_]RecordedEvent{
+        .{ .kind = .slot, .value = 1 },
+        .{ .kind = .slot, .value = 2 },
+        .{ .kind = .slot, .value = 3 },
+        .{ .kind = .slot, .value = 4 },
+        .{ .kind = .epoch, .value = 1 },
+        .{ .kind = .slot, .value = 5 },
+        .{ .kind = .slot, .value = 6 },
+    };
+    try recorder.expect(after_boundary[0..]);
 
     signal.abort();
 }

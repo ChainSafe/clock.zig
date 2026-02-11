@@ -22,7 +22,7 @@ pub fn main() !void {
     var threaded = std.Io.Threaded.init(std.heap.smp_allocator, .{ .environ = .empty });
     defer threaded.deinit();
 
-    var signal = clock.AbortSignal{};
+    var signal = clock.AbortSignal.init(threaded.io());
     const genesis_time_ms: u64 = @as(
         u64,
         @intCast(@divTrunc(std.Io.Clock.real.now(std.Options.debug_io).nanoseconds, std.time.ns_per_ms)),
