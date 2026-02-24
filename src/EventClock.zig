@@ -80,7 +80,6 @@ epoch_snapshot: std.ArrayListUnmanaged(EpochSnapshot) = .{},
 
 waiters: WaiterQueue,
 
-
 /// Initialise in-place.  Takes `*EventClock` (not returning by value)
 /// because `TimeSource.fromIo` stores a pointer into `self.io`, making
 /// the struct self-referential.
