@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(example);
 
     const run_example = b.addRunArtifact(example);
-    const run_step = b.step("run", "Run the clock_basic example");
+    const run_step = b.step("run-example", "Run the clock_basic example");
     run_step.dependOn(&run_example.step);
 
     const test_step = b.step("test", "Run zig-beacon-clock tests");
