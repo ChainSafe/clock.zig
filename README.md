@@ -119,56 +119,55 @@ This implementation matches the Lodestar `Clock` class behavior:
 | `setTimeout(this.onNextSlot, this.msUntilNextSlot())` | `std.Io.sleep` in 500ms chunks + `advanceAndDispatch` |
 | `slot 0` not emitted pre-genesis | `currentSlot()` returns `null` pre-genesis, loop skips |
 
-## Public API
-
-From `src/lib.zig`:
+## Example
 
 ```zig
+const std = @import("std");
 const clock = @import("zig_beacon_clock");
 
-// Types
-clock.Slot       // u64
-clock.Epoch      // u64
-clock.Config     // { genesis_time_sec, seconds_per_slot, slots_per_epoch, maximum_gossip_clock_disparity_ms }
-clock.ListenerId // u64
-clock.Error      // error{ InvalidConfig, OutOfMemory, ListenerLimitReached, Aborted }
+fn onSlot(_: ?*anyopaque, slot: clock.Slot) void {
+    std.debug.print("slot={d}\n", .{slot});
+}
 
-// Layer 0 — pure functions
-clock.slot_math.slotAtMs(config, now_ms) -> ?Slot
-clock.slot_math.slotAtSec(config, now_sec) -> ?Slot
-clock.slot_math.epochAtSlot(config, slot) -> ?Epoch
-clock.slot_math.slotStartSec(config, slot) -> ?UnixSec
-clock.slot_math.slotStartMs(config, slot) -> ?UnixMs
-clock.slot_math.msUntilNextSlot(config, now_ms) -> ?u64
+fn onEpoch(_: ?*anyopaque, epoch: clock.Epoch) void {
+    std.debug.print("epoch={d}\n", .{epoch});
+}
 
-// Layer 2 — event-driven clock (primary API)
-var ec: clock.EventClock = undefined;
-try ec.init(allocator, config, io);
-defer ec.deinit();
+pub fn main() !void {
+    var evented: std.Io.Evented = undefined;
+    try evented.init(std.heap.page_allocator, .{});
+    defer evented.deinit();
+    const io = evented.io();
 
-ec.start();
-ec.stop();
-ec.join();
+    const now_sec: u64 = @intCast(std.Io.Clock.real.now(io).toSeconds());
 
-ec.currentSlot() -> ?Slot
-ec.currentEpoch() -> ?Epoch
-ec.currentSlotOrGenesis() -> Slot
-ec.currentEpochOrGenesis() -> Epoch
-ec.currentSlotWithGossipDisparity() -> Slot
-ec.isCurrentSlotGivenGossipDisparity(slot) -> bool
-ec.slotWithFutureTolerance(ms) -> ?Slot
-ec.slotWithPastTolerance(ms) -> ?Slot
-ec.secFromSlot(slot, ?to_sec) -> ?i64
-ec.msFromSlot(slot, ?to_ms) -> ?i64
+    var ec: clock.EventClock = undefined;
+    try ec.init(std.heap.page_allocator, .{
+        .genesis_time_sec = now_sec,
+        .seconds_per_slot = 1,
+        .slots_per_epoch = 4,
+    }, io);
+    defer ec.deinit();
 
-try ec.onSlot(callback, ctx) -> ListenerId
-ec.offSlot(id) -> bool
-try ec.onEpoch(callback, ctx) -> ListenerId
-ec.offEpoch(id) -> bool
+    _ = try ec.onSlot(onSlot, null);
+    _ = try ec.onEpoch(onEpoch, null);
 
-var fut = try ec.waitForSlot(target);
-try fut.await(io);
-ec.cancelWait(&fut);
+    ec.start();
+
+    const start_slot = ec.currentSlotOrGenesis();
+    std.debug.print("start_slot={d}, waiting for slot {d}...\n", .{ start_slot, start_slot + 3 });
+
+    var fut = try ec.waitForSlot(start_slot + 3);
+    try fut.await(io);
+
+    std.debug.print("done.\n", .{});
+}
+```
+
+Run with:
+
+```bash
+zig build run-example
 ```
 
 ## Build & test
