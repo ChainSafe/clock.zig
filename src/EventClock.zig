@@ -88,7 +88,7 @@ pub fn init(self: *EventClock, allocator: Allocator, config: Config, io_handle: 
         .allocator = allocator,
         .io = io_handle,
         .clock = undefined,
-        .waiters = WaiterQueue.init(allocator, {}),
+        .waiters = WaiterQueue.initContext({}),
     };
     self.clock = SlotClock.init(config, TimeSource.fromIo(&self.io)) catch return error.InvalidConfig;
 }
@@ -124,7 +124,8 @@ pub fn deinit(self: *EventClock) void {
     self.epoch_snapshot.deinit(self.allocator);
     self.slot_listeners.deinit(self.allocator);
     self.epoch_listeners.deinit(self.allocator);
-    self.waiters.deinit();
+    self.waiters.deinit(self.allocator);
+    self.* = undefined;
 }
 
 // ── Listener API ──
@@ -310,7 +311,7 @@ pub fn waitForSlot(self: *EventClock, target: Slot) Error!WaitForSlotResult {
         self.allocator.destroy(state);
         return WaitForSlotResult.immediate(error.Aborted);
     }
-    self.waiters.add(.{ .target = target, .state = state }) catch return error.OutOfMemory;
+    self.waiters.push(self.allocator, .{ .target = target, .state = state }) catch return error.OutOfMemory;
     self.dispatchWaiters(self.clock.current_slot);
 
     return .{
@@ -329,7 +330,7 @@ pub fn cancelWait(self: *EventClock, result: *WaitForSlotResult) void {
         // won't dereference the freed state pointer.
         for (self.waiters.items, 0..) |entry, i| {
             if (entry.state == state) {
-                _ = self.waiters.removeIndex(i);
+                _ = self.waiters.popIndex(i);
                 break;
             }
         }
@@ -395,14 +396,14 @@ fn dispatchWaiters(self: *EventClock, current_slot: ?Slot) void {
     const slot = current_slot orelse return;
     while (self.waiters.peek()) |head| {
         if (head.target > slot) break;
-        const waiter = self.waiters.remove();
+        const waiter = self.waiters.pop().?;
         waiter.state.aborted = false;
         waiter.state.event.set(waiter.state.io);
     }
 }
 
 fn abortAllWaiters(self: *EventClock) void {
-    while (self.waiters.removeOrNull()) |waiter| {
+    while (self.waiters.pop()) |waiter| {
         waiter.state.aborted = true;
         waiter.state.event.set(waiter.state.io);
     }
