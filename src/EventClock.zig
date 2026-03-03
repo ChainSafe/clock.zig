@@ -286,6 +286,7 @@ pub const WaitForSlotResult = struct {
         // where GCD still holds a reference to the event address after wake.
         if (self.state) |s| s.allocator.destroy(s);
         self.state = null;
+        self.clock = null;
         return result;
     }
 
@@ -317,6 +318,7 @@ pub const WaitForSlotResult = struct {
         };
         state.allocator.destroy(state);
         self.state = null;
+        self.clock = null;
     }
 };
 
