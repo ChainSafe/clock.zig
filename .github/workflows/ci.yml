@@ -7,8 +7,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  zig:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
