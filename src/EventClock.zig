@@ -106,13 +106,12 @@ pub fn stop(self: *EventClock) void {
     self.abortAllWaiters();
 }
 
-/// WORKAROUND for Zig bug #31307: always await, never cancel sleeping futures.
-/// See: https://codeberg.org/ziglang/zig/issues/31307
+/// Cancel the loop fiber and wait for it to finish.
 pub fn join(self: *EventClock) void {
     var maybe_future = self.loop_future;
     self.loop_future = null;
     if (maybe_future) |*future| {
-        future.await(self.io);
+        future.cancel(self.io);
     }
 }
 
@@ -338,7 +337,6 @@ pub fn cancelWait(self: *EventClock, result: *WaitForSlotResult) void {
         state.event.set(state.io);
     }
     // Must await the fiber so it finishes before we free its state.
-    // (Cannot use Future.cancel due to Zig bug #31307.)
     // The fiber returns error.Aborted (expected) or {} (already dispatched).
     _ = result.inner.await(self.io) catch |err| {
         std.debug.assert(err == error.Aborted);
@@ -438,14 +436,10 @@ fn runAutoLoop(self: *EventClock) void {
             self.stop();
             break;
         };
-        // Sleep in short chunks so we can check `stopped` promptly.
-        // Without this, join() must wait for the full sleep to finish
-        // (we use await, not cancel, due to Zig bug #31307).
-        const chunk_ms = @min(next_ms, 500);
-        const sleep_ms = std.math.cast(i64, @max(@as(u64, 1), chunk_ms)) orelse std.math.maxInt(i64);
+        const sleep_ms = std.math.cast(i64, @max(@as(u64, 1), next_ms)) orelse std.math.maxInt(i64);
 
-        // Sleep failure (e.g., I/O shutdown, interrupt) is transient — safe to
-        // retry from the top of the loop, which will re-check `stopped` first.
+        // Sleep failure (e.g., cancel from join()) is expected —
+        // re-check `stopped` flag before continuing.
         std.Io.sleep(
             self.io,
             std.Io.Duration.fromMilliseconds(sleep_ms),
@@ -809,7 +803,7 @@ test "real-time: multi-slot advancement delivers ordered events" {
     }
 }
 
-test "real-time: stop returns within chunk window" {
+test "real-time: stop+join cancels promptly" {
     var rt: TestIo = undefined;
     try rt.init();
     defer rt.deinit();
@@ -825,7 +819,7 @@ test "real-time: stop returns within chunk window" {
 
     clock.start();
 
-    // Give the loop fiber time to enter its first sleep chunk.
+    // Give the loop fiber time to enter its sleep.
     std.Io.sleep(io_handle, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
 
     const before_ms = nowMsAt(io_handle);
@@ -833,8 +827,8 @@ test "real-time: stop returns within chunk window" {
     clock.join();
     const elapsed = nowMsAt(io_handle) - before_ms;
 
-    // The 500ms chunking means join() should return within ~500ms + overhead,
-    // NOT after the full 12-second slot duration.
+    // join() cancels the sleeping future directly, so it should return
+    // almost immediately — NOT after the full 12-second slot duration.
     try testing.expect(elapsed < 1500);
 }
 
